@@ -1,7 +1,7 @@
-"""A static, non-oracle test-impact selector for sqlglot.
+"""Conservative static test impact selector for the pinned sqlglot tree.
 
-All decisions are based on changed paths and content, and the test inventory.
-No sample answer labels or patch/answer lookups are consulted by the bot.
+Uses patch paths and content, plus the provided test inventory. Does not
+reference sample answer labels, patch identifiers or failing-test lists.
 """
 from __future__ import annotations
 import json, re, sys, os
@@ -12,16 +12,38 @@ DATA = Path(os.environ.get('DATA_DIR', '/data'))
 
 
 def edited_paths_and_lines(s):
-    paths=[]; mods=[]; signs=[]
-    path=''
+    """Extract touched paths and changed lines from git unified patches.
+
+    The old implementation missed deleted files (+ + + /dev/null) and pure
+    renames, which would silently yield an empty test selection.
+    """
+    paths = []
+    mods = []
+    path = ''
     for line in s.splitlines():
-        if line.startswith('+++ b/'):
-            path=line[6:];paths.append(path)
+        if line.startswith('diff --git a/'):
+            # Save the old path immediately: deletions do not have a +++ b/ line.
+            old = line[len('diff --git a/'):].split(' b/', 1)[0]
+            if old and old not in paths:
+                paths.append(old)
+            path = old
+        elif line.startswith('+++ b/'):
+            path = line[6:].strip()
+            if path not in paths:
+                paths.append(path)
+        elif line.startswith('rename from '):
+            path = line[len('rename from '):].strip()
+            if path not in paths:
+                paths.append(path)
+        elif line.startswith('rename to '):
+            path = line[len('rename to '):].strip()
+            if path not in paths:
+                paths.append(path)
         elif line.startswith('+') and not line.startswith('+++'):
-            mods.append((path,line[1:])); signs.append(line[1:])
+            mods.append((path, line[1:]))
         elif line.startswith('-') and not line.startswith('---'):
-            mods.append((path,line[1:])); signs.append(line[1:])
-    return paths,mods
+            mods.append((path, line[1:]))
+    return paths, mods
 
 
 def is_comment_only(mods):
@@ -37,7 +59,9 @@ def norm(s):
 
 
 def select_tests(paths, mods, tests):
-    if is_comment_only(mods):return set()
+    # Never assume comment-looking additions are harmless: a Python triple-
+    # quoted string, SQL fixture, or tokenizer fixture may contain # lines.
+    # The competition explicitly does not guarantee harmless comments.
     by_file=defaultdict(list)
     for t in tests:by_file[t['file']].append(t)
     chosen=set()
@@ -53,23 +77,55 @@ def select_tests(paths, mods, tests):
             method=t['id'].split('::')[-1]
             if norm(method.removeprefix('test_'))==n or norm(method.removeprefix('test_')) in (n+'s',n.rstrip('s')):add(t)
     all_paths=set(paths)
-    # Every changed fixture is exercised by the optimizer method of matching name.
+    # Every changed fixture is exercised by optimizer methods with matching names.
     for p in paths:
         if p.startswith('tests/fixtures/optimizer/'):
             name=Path(p).stem
             opt_name(name)
             if name=='pushdown_projections':opt_name('pushdown_projection')
             if name.endswith('_ddl'):opt_name(name.removesuffix('_ddl'))
+            # These suffixes identify variants of the same fixture family.
+            # Back off to the main optimizer method when a fixture's specific
+            # suffix is not named in the tests manifest.
+            if '__' in name:opt_name(name.split('__', 1)[0])
+            # Unknown fixture naming conventions must not produce an empty run.
+            # Broad inexpensive optimizer tests are preferable to a 300s miss.
+            if not chosen:
+                for t in by_file.get('tests/test_optimizer.py', []):
+                    if t['seconds'] <= 1.5:
+                        add(t)
         elif p.startswith('tests/fixtures/'):
             # Other fixture groups can affect a family of tests in the same dialect.
             name=Path(p).stem
             dialect=p.split('/')[2] if len(p.split('/'))>3 else ''
             file('tests/dialects/test_'+dialect+'.py')
             match(name)
+            if not chosen:
+                for t in tests:
+                    if t['seconds'] <= 1.5:
+                        add(t)
         elif p.startswith('tests/') and p.endswith('.py'):
             file(p)
-    code_paths=[p for p in paths if p.startswith('sqlglot/')]
-    if not code_paths:return chosen
+    code_paths=[p for p in paths if p.startswith(('sqlglot/', 'sqlglotc/'))]
+    if not code_paths:
+        # Non-documentation changes to packaging/build files can affect
+        # imports, and a test can fail to import even when the source lines
+        # are unchanged. Treat them as potentially broad changes.
+        important = any(p.endswith(('.py', '.toml', '.cfg', '.ini', '.json'))
+                        and not p.startswith(('tests/', 'docs/')) for p in paths)
+        if not important:
+            return chosen
+        for t in tests:
+            if t['seconds'] <= 1.5:
+                add(t)
+        return chosen
+    # Global low-cost regression shield: almost all sqlglot tests take less
+    # than 1.5 seconds individually. Running them catches cross-module effects
+    # missed by path-based heuristics, at modest simulated cost (worker setup
+    # dominates tiny tests). The few very expensive tests are targeted below.
+    for t in tests:
+        if t['seconds'] <= 1.5:
+            add(t)
     for p in code_paths:
         stem=Path(p).stem
         parts=Path(p).parts
@@ -94,6 +150,10 @@ def select_tests(paths, mods, tests):
                 # parser has numerous integration contexts, but large generic
                 # tests are too expensive unless patch impacts shared behavior.
         elif '/optimizer/' in p:
+            # The optimizer is a chain of interacting passes; fast global tests
+            # cover most regression cases, and we additionally keep *all*
+            # optimizer tests, including slow scope / TPC-DS tests.
+            file('tests/test_optimizer.py')
             # Focus on optimizer tests exercising this pass, plus end-to-end
             # optimization smoke tests. Full optimizer collection contains
             # expensive unrelated long-running coverage.
@@ -119,6 +179,7 @@ def select_tests(paths, mods, tests):
             if stem in ('eliminate_subqueries','merge_subqueries','pushdown_predicates'):
                 opt_name('merge_subqueries');opt_name('unnest_subqueries')
         elif '/typing/' in p:
+            file('tests/test_optimizer.py')
             for name in ('annotate_funcs','annotate_types','optimize','qualify_columns'):
                 opt_name(name)
             file('tests/test_typing.py')
@@ -129,6 +190,7 @@ def select_tests(paths, mods, tests):
                 if f.startswith('tests/dialects/'):file(f)
             file('tests/test_expressions.py')
         elif '/executor/' in p:
+            file('tests/test_executor.py')
             # Context changes are usually exercised through executor-specific
             # tests; expensive integration tests are selected for runner changes.
             if stem != 'context':
@@ -148,6 +210,7 @@ def select_tests(paths, mods, tests):
                 opt_name('optimize')
                 file('tests/test_generator.py')
         elif stem in ('transforms','generator'):
+            file('tests/test_generator.py')
             file('tests/test_transforms.py');file('tests/test_generator.py')
         elif stem=='schema':
             file('tests/test_schema.py');file('tests/test_optimizer.py')
@@ -174,6 +237,19 @@ def select_tests(paths, mods, tests):
         if any(k in txt for k in ('typeannotat','_annotate','set_type','exp.','expression')):
             for k in ('annotate_funcs','annotate_types','optimize','qualify_columns'):
                 opt_name(k)
+    # Highly expensive tests, which the global budget deliberately excludes.
+    # Enable them when changes touch the code paths they stress. The rules
+    # require these selections to depend only on paths, not sample answers.
+    for p in code_paths:
+        name = Path(p).name
+        if name in ('parser.py', 'tokens.py', 'tokenizer.py', 'expressions.py', 'exp.py') and not ('/parsers/' in p or '/tokens/' in p):
+            file('tests/test_parser.py')
+        if ('/generators/' in p or name == 'generator.py') and ('memory' in txt or name == 'generator.py'):
+            file('tests/test_generator.py')
+        if '/optimizer/' in p or '/typing/' in p or '/executor/' in p or name in ('serde.py', 'schema.py'):
+            file('tests/test_optimizer.py')
+        if name in ('executor.py', 'context.py', 'serde.py') or ('/optimizer/' in p and any(k in txt for k in ('execute','executor','tpcds','tpch'))):
+            file('tests/test_executor.py')
     return chosen
 
 
